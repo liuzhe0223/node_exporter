@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/promslog/flag"
@@ -32,6 +33,7 @@ import (
 	promcollectors "github.com/prometheus/client_golang/prometheus/collectors"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/push"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
@@ -51,6 +53,8 @@ type handler struct {
 	includeExporterMetrics  bool
 	maxRequests             int
 	logger                  *slog.Logger
+
+	collectorMetricsRegistry *prometheus.Registry
 }
 
 func newHandler(includeExporterMetrics bool, maxRequests int, logger *slog.Logger) *handler {
@@ -175,6 +179,7 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 		)
 	}
 
+	h.collectorMetricsRegistry = r
 	return handler, nil
 }
 
@@ -200,6 +205,23 @@ func main() {
 			"runtime.gomaxprocs", "The target number of CPUs Go will run on (GOMAXPROCS)",
 		).Envar("GOMAXPROCS").Default("1").Int()
 		toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9100")
+
+		pushgatewayURL = kingpin.Flag(
+			"pushgateway.url",
+			"The URL of the Pushgateway to push metrics to.",
+		).Default("").String()
+		pushgatewayUsername = kingpin.Flag(
+			"pushgateway.username",
+			"The username to use when pushing metrics to the Pushgateway.",
+		).Default("").String()
+		pushgatewayPassword = kingpin.Flag(
+			"pushgateway.password",
+			"The password to use when pushing metrics to the Pushgateway.",
+		).Default("").String()
+		pushgatewayInterval = kingpin.Flag(
+			"pushgateway.interval",
+			"The interval to push metrics to the Pushgateway.",
+		).Default("1m").Duration()
 	)
 
 	promslogConfig := &promslog.Config{}
@@ -221,7 +243,31 @@ func main() {
 	runtime.GOMAXPROCS(*maxProcs)
 	logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 
-	http.Handle(*metricsPath, newHandler(!*disableExporterMetrics, *maxRequests, logger))
+	handler := newHandler(!*disableExporterMetrics, *maxRequests, logger)
+	if *pushgatewayURL != "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			logger.Error("Failed to get hostname", "err", err)
+			os.Exit(1)
+		}
+
+		pusher := push.New(*pushgatewayURL, "node_exporter").
+			Grouping("hostname", hostname).
+			BasicAuth(*pushgatewayUsername, *pushgatewayPassword).
+			Gatherer(handler.collectorMetricsRegistry)
+		go func() {
+			for {
+				time.Sleep(*pushgatewayInterval)
+				err := pusher.Push()
+				if err != nil {
+					logger.Error("Failed to push metrics to Pushgateway", "err", err)
+					continue
+				}
+			}
+		}()
+	}
+
+	http.Handle(*metricsPath, handler)
 	if *metricsPath != "/" {
 		landingConfig := web.LandingConfig{
 			Name:        "Node Exporter",
